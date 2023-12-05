@@ -331,6 +331,50 @@ class ExpressionToCExpressionMapper(IdentityMapper):
     def make_subscript(self, array, base_expr, subscript):
         return base_expr[subscript]
 
+    def map_sum(self, expr, *args, **kwargs):
+        children = [self.rec(child, *args, **kwargs) for child in expr.children]
+
+        # Check to see if we have a mix of signed and unsigned types
+        has_signed = False
+        for child in children:
+            try:
+                ty = self.infer_type(child)
+                if np.dtype(ty).kind == 'i':
+                    has_signed = True
+            except:
+                pass
+
+        if has_signed:
+            new_children = []
+            for child in children:
+               try:
+                   ty = self.infer_type(child)
+                   dty = np.dtype(ty)
+                   if dty.kind == 'u':
+                       new_type = None
+                       if dty.type is np.uint8:
+                           new_type = np.int8
+                       elif dty.type is np.uint16:
+                           new_type = np.int16
+                       elif dty.type is np.uint32:
+                           new_type = np.int32
+                       elif dty.type is np.uint64:
+                           new_type = np.int64
+                       else:
+                           raise RuntimeError(f'Unknown unsigned type: {ty}')
+
+                       registry = self.codegen_state.ast_builder.target.get_dtype_registry()
+                       cast = var(f'({registry.dtype_to_ctype(new_type)})')
+                       new_children.append(cast(child))
+                   else:
+                       new_children.append(child)
+               except Exception as e:
+                   new_children.append(child)
+
+            return type(expr)(tuple(new_children))
+        else:
+            return type(expr)(tuple(children))
+
     def map_integer_div_operator(self, base_func_name, op_func, expr, type_context):
         from loopy.symbolic import get_dependencies
         iname_deps = get_dependencies(expr) & self.kernel.all_inames()
