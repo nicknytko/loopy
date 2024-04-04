@@ -342,7 +342,8 @@ class ExpressionToCExpressionMapper(IdentityMapper):
                 if np.dtype(ty).kind == 'i':
                     has_signed = True
             except:
-                pass
+                # If there's no type, then assume we have a mix to be safe
+                has_signed = True
 
         if has_signed:
             new_children = []
