@@ -1,4 +1,5 @@
 """Target for Intel ISPC."""
+from __future__ import annotations
 
 
 __copyright__ = "Copyright (C) 2015 Andreas Kloeckner"
@@ -23,26 +24,51 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
+import operator
+from functools import reduce
+from typing import TYPE_CHECKING, Iterable, Sequence, cast
 
-from typing import cast, Tuple, Sequence
+import numpy as np
 
-import numpy as np  # noqa
 import pymbolic.primitives as p
+from cgen import Collection, Const, Declarator, Generable
 from pymbolic import var
 from pymbolic.mapper.stringifier import PREC_NONE
 from pytools import memoize_method
-from cgen import Generable, Declarator, Const, Collection
 
-from loopy.target.c import CFamilyTarget, CFamilyASTBuilder
-from loopy.target.c.codegen.expression import ExpressionToCExpressionMapper
 from loopy.diagnostic import LoopyError
-from loopy.symbolic import Literal
-from loopy.schedule import CallKernel
-from loopy.typing import ExpressionT
-from loopy.types import LoopyType
-from loopy.kernel.data import AddressSpace, TemporaryVariable, ArrayArg
-from loopy.codegen import CodeGenerationState
-from loopy.codegen.result import CodeGenerationResult
+from loopy.kernel.data import AddressSpace, ArrayArg, TemporaryVariable
+from loopy.symbolic import CombineMapper, Literal
+from loopy.target.c import CFamilyASTBuilder, CFamilyTarget
+from loopy.target.c.codegen.expression import ExpressionToCExpressionMapper
+
+
+if TYPE_CHECKING:
+    from loopy.codegen import CodeGenerationState
+    from loopy.codegen.result import CodeGenerationResult
+    from loopy.schedule import CallKernel
+    from loopy.types import LoopyType
+    from loopy.typing import Expression
+
+
+class IsVaryingMapper(CombineMapper[bool, []]):
+    def combine(self, values: Iterable[bool]) -> bool:
+        return reduce(operator.or_, values, False)
+
+    def map_constant(self, expr):
+        return False
+
+    def map_group_hw_index(self, expr):
+        return False
+
+    def map_local_hw_index(self, expr):
+        if expr.axis == 0:
+            return True
+        else:
+            raise LoopyError("ISPC only supports one local axis")
+
+    def map_variable(self, expr):
+        return False
 
 
 # {{{ expression mapper
@@ -79,7 +105,7 @@ class ExprToISPCExprMapper(ExpressionToCExpressionMapper):
             elif type_context in ["i", "b"]:
                 return expr
             else:
-                from loopy.tools import is_integer
+                from loopy.typing import is_integer
                 if is_integer(expr):
                     return expr
 
@@ -111,13 +137,14 @@ class ExprToISPCExprMapper(ExpressionToCExpressionMapper):
 
         if (isinstance(ary, TemporaryVariable)
                 and ary.address_space == AddressSpace.PRIVATE):
-            # generate access code for acccess to private-index temporaries
+            # generate access code for access to private-index temporaries
 
-            gsize, lsize = self.kernel.get_grid_size_upper_bounds_as_exprs()
+            _gsize, lsize = self.kernel.get_grid_size_upper_bounds_as_exprs()
             if lsize:
                 lsize, = lsize
-                from loopy.kernel.array import get_access_info
                 from pymbolic import evaluate
+
+                from loopy.kernel.array import get_access_info
 
                 access_info = get_access_info(self.kernel, ary, expr.index,
                     lambda expr: evaluate(expr, self.codegen_state.var_subst_map),
@@ -135,6 +162,29 @@ class ExprToISPCExprMapper(ExpressionToCExpressionMapper):
 
         return super().map_subscript(
                 expr, type_context)
+
+    def wrap_in_typecast(self, actual_type: LoopyType, needed_type: LoopyType, s):
+        raise NotImplementedError("wrap_in_typecast needs uniform-ness information "
+                                  "for ispc")
+
+    def rec(self, expr, type_context=None, needed_type: LoopyType | None = None):  # type: ignore[override]
+        result = super().rec(expr, type_context)
+
+        if needed_type is None:
+            return result
+        else:
+            actual_type = self.infer_type(expr)
+            if actual_type != needed_type:
+                # FIXME: problematic: quadratic complexity
+                is_varying = IsVaryingMapper()(expr)
+                registry = self.codegen_state.ast_builder.target.get_dtype_registry()
+                cast = var("("
+                           f"{'varying' if is_varying else 'uniform'} "
+                           f"{registry.dtype_to_ctype(needed_type)}"
+                           ") ")
+                return cast(result)
+
+            return result
 
 # }}}
 
@@ -172,7 +222,7 @@ class ISPCTarget(CFamilyTarget):
     device_program_name_suffix = "_inner"
 
     def pre_codegen_entrypoint_check(self, kernel, callables_table):
-        gsize, lsize = kernel.get_grid_size_upper_bounds_as_exprs(
+        _gsize, lsize = kernel.get_grid_size_upper_bounds_as_exprs(
                 callables_table)
         if len(lsize) > 1:
             for ls_i in lsize[1:]:
@@ -206,17 +256,17 @@ class ISPCASTBuilder(CFamilyASTBuilder):
     def get_function_declaration(
             self, codegen_state: CodeGenerationState,
             codegen_result: CodeGenerationResult, schedule_index: int
-            ) -> Tuple[Sequence[Tuple[str, str]], Generable]:
+            ) -> tuple[Sequence[tuple[str, str]], Generable]:
         name = codegen_result.current_program(codegen_state).name
         kernel = codegen_state.kernel
 
         assert codegen_state.kernel.linearization is not None
         subkernel_name = cast(
-                        CallKernel,
+                        "CallKernel",
                         codegen_state.kernel.linearization[schedule_index]
                         ).kernel_name
 
-        from cgen import (FunctionDeclaration, Value)
+        from cgen import FunctionDeclaration, Value
         from cgen.ispc import ISPCExport, ISPCTask
 
         if codegen_state.is_entrypoint:
@@ -235,7 +285,7 @@ class ISPCASTBuilder(CFamilyASTBuilder):
                         for arg_name in passed_names]
 
         if codegen_state.is_generating_device_code:
-            result = ISPCTask(
+            result: Declarator = ISPCTask(
                         FunctionDeclaration(
                             Value("void", name),
                             arg_decls))
@@ -250,14 +300,14 @@ class ISPCASTBuilder(CFamilyASTBuilder):
 
     def get_kernel_call(self, codegen_state: CodeGenerationState,
             subkernel_name: str,
-            gsize: Tuple[ExpressionT, ...],
-            lsize: Tuple[ExpressionT, ...]) -> Generable:
+            gsize: tuple[Expression, ...],
+            lsize: tuple[Expression, ...]) -> Generable:
         kernel = codegen_state.kernel
         ecm = self.get_expression_to_code_mapper(codegen_state)
 
         from pymbolic.mapper.stringifier import PREC_NONE
         result = []
-        from cgen import Statement as S, Block
+        from cgen import Block, Statement as S
         if lsize:
             result.append(
                     S(
@@ -311,17 +361,17 @@ class ISPCASTBuilder(CFamilyASTBuilder):
 
     # {{{ declarators
 
-    def get_value_arg_declaraotor(
+    def get_value_arg_declarator(
             self, name: str, dtype: LoopyType, is_written: bool) -> Declarator:
         from cgen.ispc import ISPCUniform
-        return ISPCUniform(super().get_value_arg_declaraotor(
+        return ISPCUniform(super().get_value_arg_declarator(
                 name, dtype, is_written))
 
     def get_array_arg_declarator(
             self, arg: ArrayArg, is_written: bool) -> Declarator:
         # FIXME restrict?
-        from cgen.ispc import ISPCUniformPointer, ISPCUniform
-        decl = ISPCUniform(
+        from cgen.ispc import ISPCUniform, ISPCUniformPointer
+        decl: Declarator = ISPCUniform(
                 ISPCUniformPointer(self.get_array_base_declarator(arg)))
 
         if not is_written:
@@ -371,8 +421,9 @@ class ISPCASTBuilder(CFamilyASTBuilder):
         if insn.atomicity:
             raise NotImplementedError("atomic ops in ISPC")
 
-        from loopy.expression import dtype_to_type_context
         from pymbolic.mapper.stringifier import PREC_NONE
+
+        from loopy.expression import dtype_to_type_context
 
         rhs_type_context = dtype_to_type_context(kernel.target, lhs_dtype)
         rhs_code = ecm(insn.expression, prec=PREC_NONE,
@@ -387,9 +438,9 @@ class ISPCASTBuilder(CFamilyASTBuilder):
         if UseStreamingStoreTag() in insn.tags:
             ary = ecm.find_array(lhs)
 
-            from loopy.kernel.array import get_access_info
             from pymbolic import evaluate
 
+            from loopy.kernel.array import get_access_info
             from loopy.symbolic import simplify_using_aff
             index_tuple = tuple(
                     simplify_using_aff(kernel, idx) for idx in lhs.index_tuple)
@@ -408,7 +459,7 @@ class ISPCASTBuilder(CFamilyASTBuilder):
                 raise LoopyError("streaming stores must have a subscript")
             subscript, = access_info.subscripts
 
-            from pymbolic.primitives import Sum, flattened_sum, Variable
+            from pymbolic.primitives import Sum, Variable, flattened_sum
             if isinstance(subscript, Sum):
                 terms = subscript.children
             else:
@@ -479,12 +530,11 @@ class ISPCASTBuilder(CFamilyASTBuilder):
             lbound, ubound, inner, hints):
         ecm = codegen_state.expression_to_code_mapper
 
-        from loopy.target.c import POD
-
-        from pymbolic.mapper.stringifier import PREC_NONE
         from cgen import For, InlineInitializer
-
         from cgen.ispc import ISPCUniform
+        from pymbolic.mapper.stringifier import PREC_NONE
+
+        from loopy.target.c import POD
 
         loop = For(
                 InlineInitializer(
@@ -497,7 +547,7 @@ class ISPCASTBuilder(CFamilyASTBuilder):
                 inner)
 
         if hints:
-            return Collection(list(hints) + [loop])
+            return Collection([*list(hints), loop])
         else:
             return loop
 

@@ -25,7 +25,7 @@ consist of arithmetic operations and calls to functions.
 If the outermost operation of the RHS expression is a function call,
 the RHS value may be a tuple, and multiple (still scalar) arrays appear
 as LHS values. (This is the only sense in which tuple types are supported.)
-Each statement is parametrized by zero or more loop variables ("inames").
+Each statement is parameterized by zero or more loop variables ("inames").
 A statement is executed once for each integer point defined by the domain
 forest for the iname tuple given for that statement
 (:attr:`loopy.InstructionBase.within_inames`). Each execution of a
@@ -262,6 +262,7 @@ Instructions
 
 .. {{{
 
+.. autoclass:: HappensAfter
 .. autoclass:: InstructionBase
 
 .. _assignments:
@@ -537,8 +538,6 @@ have the lifetime of a kernel invocation.
 .. autoclass:: AddressSpace
 
 .. autoclass:: TemporaryVariable
-    :members:
-    :undoc-members:
 
 .. _types:
 
@@ -657,8 +656,6 @@ Helper values
 
 .. {{{
 
-.. autoclass:: auto
-
 .. autoclass:: UniqueName
 
 .. autoclass:: Optional
@@ -694,11 +691,7 @@ The Kernel Object
 Do not create :class:`LoopKernel` objects directly. Instead, refer to
 :ref:`creating-kernels`.
 
-.. autoclass:: LoopKernel
-
-.. autoclass:: KernelState
-    :members:
-    :undoc-members:
+.. automodule:: loopy.kernel
 
 Implementation Details: The Base Array
 --------------------------------------
